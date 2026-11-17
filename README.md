@@ -1,2 +1,0 @@
-# BSTA374_Project
-
