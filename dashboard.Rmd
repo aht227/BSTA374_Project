@@ -1,0 +1,569 @@
+---
+title: "Pennsylvania Drug Overdose Mortality, 2020–2024"
+subtitle: "BSTA 374 · Milestone M1 · Static Dashboard"
+author: "Ahmad Tariq · Lehigh University"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: scroll
+    theme: cosmo
+    source_code: embed
+    self_contained: true
+---
+
+<style>
+.leaflet-container {
+  background: #F0F3F6 !important;
+}
+
+.leaflet.html-widget {
+  height: 460px !important;
+}
+</style>
+
+# Dashboard
+
+```{r setup, include=FALSE}
+# M1: Static Dashboard
+# Pennsylvania Drug Overdose Mortality, 2020-2024
+
+library(flexdashboard)
+library(dplyr)
+library(readr)
+library(tidyr)
+library(sf)
+library(tigris)
+library(leaflet)
+library(ggplot2)
+library(plotly)
+
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE
+)
+
+options(tigris_use_cache = TRUE)
+```
+
+```{r data_and_boundaries, include=FALSE}
+# Load CDC overdose death counts
+
+cdc <- read_csv(
+  "data/VSRR_Provisional_County-Level_Drug_Overdose_Death_Counts.csv",
+  col_types = cols(
+    FIPS = col_character(),
+    .default = col_guess()
+  ),
+  show_col_types = FALSE
+)
+
+# Load Census county population estimates
+
+pop <- read_csv(
+  "data/co-est2024-alldata.csv",
+  col_types = cols(
+    STATE = col_character(),
+    COUNTY = col_character(),
+    .default = col_guess()
+  ),
+  show_col_types = FALSE
+)
+
+# Load Pennsylvania county boundaries
+
+pa_map <- counties(
+  state = "PA",
+  cb = TRUE,
+  year = 2024,
+  progress_bar = FALSE
+) |>
+  st_transform(4326) |>
+  select(GEOID, NAME)
+```
+
+```{r clean_cdc, include=FALSE}
+# Select Pennsylvania overdose death counts
+# December-ending annual periods, 2020-2024
+# Suppressed counts remain missing
+
+cdc_pa <- cdc |>
+  filter(
+    ST_ABBREV == "PA",
+    as.integer(Month) == 12,
+    as.integer(Year) %in% 2020:2024
+  ) |>
+  transmute(
+    GEOID = sprintf("%05d", as.integer(FIPS)),
+    year = as.integer(Year),
+    Y = suppressWarnings(
+      as.numeric(
+        gsub(
+          ",", "",
+          as.character(`Provisional Drug Overdose Deaths`)
+        )
+      )
+    ),
+    cdc_row_present = TRUE
+  ) |>
+  mutate(
+    Y = if_else(
+      !is.na(Y) & Y >= 0,
+      Y,
+      NA_real_
+    )
+  )
+```
+
+```{r clean_population, include=FALSE}
+# Prepare Pennsylvania county populations
+# Preserve five-digit GEOID identifiers
+
+pop_long <- pop |>
+  filter(
+    as.integer(STATE) == 42,
+    as.integer(COUNTY) != 0
+  ) |>
+  transmute(
+    GEOID = sprintf(
+      "%02d%03d",
+      as.integer(STATE),
+      as.integer(COUNTY)
+    ),
+    across(
+      all_of(paste0("POPESTIMATE", 2020:2024)),
+      as.numeric
+    )
+  ) |>
+  pivot_longer(
+    cols = starts_with("POPESTIMATE"),
+    names_to = "year",
+    names_prefix = "POPESTIMATE",
+    values_to = "Population"
+  ) |>
+  mutate(
+    year = as.integer(year)
+  )
+```
+
+```{r join_and_validate, include=FALSE}
+# Validate county-year observations
+
+if (
+  nrow(pop_long) != 67 * 5 ||
+  anyDuplicated(pop_long[c("GEOID", "year")]) > 0
+) {
+  stop("Check Census county-year records.")
+}
+
+if (
+  anyDuplicated(cdc_pa[c("GEOID", "year")]) > 0
+) {
+  stop("Duplicate CDC county-year records.")
+}
+
+# Join population, overdose deaths, and county names
+
+pa_data <- pop_long |>
+  left_join(
+    cdc_pa,
+    by = c("GEOID", "year")
+  ) |>
+  left_join(
+    st_drop_geometry(pa_map) |>
+      transmute(
+        GEOID,
+        county = NAME
+      ),
+    by = "GEOID"
+  ) |>
+  mutate(
+    reported = !is.na(Y) &
+      !is.na(Population) &
+      Population > 0
+  )
+
+# Verify geographic matching
+
+if (any(is.na(pa_data$county))) {
+  stop("Census and county map GEOIDs do not match.")
+}
+```
+
+```{r expected_deaths, include=FALSE}
+# Calculate annual Pennsylvania reference rates
+# Include counties with reported overdose death counts
+
+reference <- pa_data |>
+  filter(reported) |>
+  group_by(year) |>
+  summarise(
+    ref_rate = sum(Y) / sum(Population),
+    .groups = "drop"
+  )
+
+# Check valid annual reference rates
+
+if (
+  !all(2020:2024 %in% reference$year) ||
+  any(!is.finite(reference$ref_rate)) ||
+  any(reference$ref_rate <= 0)
+) {
+  stop("Unable to calculate annual reference rates.")
+}
+
+# Calculate expected deaths, SMRs, and crude rates
+
+pa_data <- pa_data |>
+  left_join(reference, by = "year") |>
+  mutate(
+    E = if_else(
+      reported,
+      Population * ref_rate,
+      NA_real_
+    ),
+    SMR = if_else(
+      reported & E > 0,
+      Y / E,
+      NA_real_
+    ),
+    rate = if_else(
+      reported,
+      100000 * Y / Population,
+      NA_real_
+    )
+  )
+```
+
+```{r map_data, include=FALSE}
+# Pool observed and expected deaths by county
+
+by_area <- pa_data |>
+  group_by(GEOID, county) |>
+  summarise(
+    reported_years = sum(reported),
+
+    observed = if (all(!reported)) {
+      NA_real_
+    } else {
+      sum(Y[reported])
+    },
+
+    expected = if (all(!reported)) {
+      NA_real_
+    } else {
+      sum(E[reported])
+    },
+
+    .groups = "drop"
+  ) |>
+  mutate(
+    SMR = if_else(
+      !is.na(expected) & expected > 0,
+      observed / expected,
+      NA_real_
+    )
+  )
+
+# Attach county-level results to map geometry
+
+my_map <- pa_map |>
+  left_join(
+    by_area,
+    by = "GEOID"
+  ) |>
+  mutate(
+    label_text = paste0(
+      NAME,
+      " | SMR: ",
+      if_else(
+        is.na(SMR),
+        "Unavailable",
+        sprintf("%.2f", SMR)
+      ),
+      " | Observed deaths: ",
+      if_else(
+        is.na(observed),
+        "Unavailable",
+        format(observed, big.mark = ",", trim = TRUE)
+      ),
+      " | Expected deaths: ",
+      if_else(
+        is.na(expected),
+        "Unavailable",
+        sprintf("%.1f", expected)
+      ),
+      " | Reported years: ",
+      reported_years,
+      " of 5"
+    )
+  )
+```
+
+```{r trend_data, include=FALSE}
+# Evaluate missing and suppressed observations
+
+join_check <- sum(is.na(my_map$SMR))
+
+missing_map_names <- my_map$NAME[
+  is.na(my_map$SMR)
+]
+
+n_suppressed <- sum(
+  !is.na(pa_data$cdc_row_present) &
+  is.na(pa_data$Y)
+)
+
+n_no_cdc_row <- sum(
+  is.na(pa_data$cdc_row_present)
+)
+
+n_partial <- sum(
+  by_area$reported_years > 0 &
+  by_area$reported_years < 5
+)
+
+# Compare Pennsylvania with Allegheny County
+
+focus <- "Allegheny"
+
+if (!focus %in% pa_data$county) {
+  stop("Focus county not found.")
+}
+
+# Annual rates among reporting Pennsylvania counties
+
+pa_year <- pa_data |>
+  filter(reported) |>
+  group_by(year) |>
+  summarise(
+    Y = sum(Y),
+    Population = sum(Population),
+    rate = 100000 * Y / Population,
+    .groups = "drop"
+  ) |>
+  mutate(
+    area = "PA (reporting counties)"
+  )
+
+# Allegheny County annual mortality rates
+
+one <- pa_data |>
+  filter(county == focus) |>
+  mutate(
+    area = focus
+  )
+
+# Combine Pennsylvania and county time series
+
+trends <- bind_rows(
+  pa_year |> select(year, rate, area),
+  one |> select(year, rate, area)
+)
+```
+
+```{r trend_interpretation, include=FALSE}
+# Generate interpretations from the observed data
+
+change_note <- function(x, label) {
+
+  start <- x$rate[match(2020, x$year)]
+  end <- x$rate[match(2024, x$year)]
+
+  if (is.na(start) || is.na(end)) {
+    return(
+      paste0(
+        label,
+        " cannot be compared between 2020 and 2024 ",
+        "because a count is unavailable."
+      )
+    )
+  }
+
+  direction <- if (end > start) {
+    "increased"
+  } else if (end < start) {
+    "decreased"
+  } else {
+    "remained unchanged"
+  }
+
+  sprintf(
+    "%s crude rate %s from %.1f in 2020 to %.1f in 2024 deaths per 100,000.",
+    label,
+    direction,
+    start,
+    end
+  )
+}
+
+trend_note <- paste(
+  change_note(
+    pa_year,
+    "The Pennsylvania reporting-county"
+  ),
+  change_note(
+    one,
+    "Allegheny County's"
+  )
+)
+```
+
+## Column {data-width=600}
+
+### Drug overdose mortality SMR by Pennsylvania county, 2020–2024
+
+```{r map}
+# Red-blue diverging SMR palette
+# Blue = below expected; red = above expected
+
+breaks <- c(
+  0, 0.5, 2/3, 0.9,
+  1/0.9, 1.5, 2, Inf
+)
+
+pal <- colorBin(
+  palette = rev(
+    RColorBrewer::brewer.pal(7, "RdBu")
+  ),
+  domain = my_map$SMR,
+  bins = breaks,
+  na.color = "#D9D9D9"
+)
+
+# Pennsylvania map with USGS topographic background
+# No OpenStreetMap or CARTO API-key issues
+
+leaflet(
+  my_map,
+  height = 460,
+  options = leafletOptions(
+    minZoom = 5,
+    maxZoom = 12,
+    zoomSnap = 0.1,
+    zoomDelta = 0.5,
+    zoomControl = TRUE
+  )
+) |>
+  addProviderTiles("USGS.USTopo") |>
+  addPolygons(
+    fillColor = ~pal(SMR),
+    fillOpacity = 0.82,
+    color = "white",
+    weight = 1,
+    label = ~label_text,
+    highlightOptions = highlightOptions(
+      weight = 2,
+      color = "black",
+      bringToFront = TRUE
+    )
+  ) |>
+  addLegend(
+    position = "topright",
+    pal = pal,
+    values = ~SMR,
+    title = "SMR (observed / expected; ratio)",
+    labFormat = labelFormat(digits = 2),
+    opacity = 0.9
+  ) |>
+  fitBounds(
+    lng1 = -80.65,
+    lat1 = 39.65,
+    lng2 = -74.65,
+    lat2 = 42.55
+  )
+```
+
+**Reading the map:** Blue counties have fewer observed overdose deaths than expected based on annual mortality rates among reporting Pennsylvania counties, while red counties have more deaths than expected. Grey counties have unavailable data. Hover over a county to see its SMR, observed deaths, expected deaths, and number of years reported. These are crude comparisons rather than age-adjusted SMRs.
+
+## Column {data-width=400}
+
+### Annual drug overdose death rates, Pennsylvania and Allegheny County, 2020–2024
+
+```{r timeseries}
+# Compare Pennsylvania and Allegheny County
+
+line_colors <- setNames(
+  c("#333333", "#B2182B"),
+  c("PA (reporting counties)", focus)
+)
+
+p <- ggplot(
+  trends,
+  aes(
+    x = year,
+    y = rate,
+    colour = area,
+    group = area
+  )
+) +
+  geom_line(
+    linewidth = 0.9,
+    na.rm = TRUE
+  ) +
+  geom_point(
+    size = 2,
+    na.rm = TRUE
+  ) +
+  scale_x_continuous(
+    breaks = 2020:2024
+  ) +
+  scale_colour_manual(
+    values = line_colors
+  ) +
+  labs(
+    x = "Year",
+    y = "Deaths per 100,000 residents",
+    colour = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    plot.margin = margin(10, 10, 10, 10),
+    axis.text.x = element_text(size = 10),
+    axis.title = element_text(size = 11)
+  )
+
+ggplotly(
+  p,
+  height = 340,
+  tooltip = c("x", "y", "colour")
+) |>
+  layout(
+    autosize = TRUE,
+    legend = list(
+      orientation = "h",
+      x = 0,
+      y = -0.2
+    ),
+    margin = list(
+      l = 65,
+      r = 15,
+      b = 65,
+      t = 15
+    )
+  )
+```
+
+### About these data
+
+**Time-series interpretation:** `r trend_note` The Pennsylvania comparison includes only counties with reported overdose death counts in each year. Suppressed observations are not treated as zero. Missing death counts, including those withheld for privacy reasons, were treated as missing data rather than zero.
+
+**Outcome and period:** This dashboard examines provisional drug overdose death counts by Pennsylvania county of residence for December-ending 12-month periods from 2020 through 2024.
+
+**Population and geography:** The analysis covers Pennsylvania's 67 counties. County population denominators are annual estimates from the U.S. Census Bureau.
+
+**Methods:** Expected overdose deaths are calculated by multiplying each county's population by the corresponding annual crude mortality rate among Pennsylvania counties with reported counts. The standardized mortality ratio (SMR) equals total observed deaths divided by total expected deaths across available years. An SMR above 1 indicates more deaths than expected, while an SMR below 1 indicates fewer deaths than expected. These comparisons are not adjusted for age.
+
+**Annual mortality rates:** Annual overdose death rates are calculated by dividing reported deaths by the population and multiplying by 100,000. The Pennsylvania comparison only includes counties with available death counts each year, so it may not reflect the full statewide mortality rate.
+
+**Data sources:**
+
+- [CDC/NCHS provisional county-level drug overdose deaths](https://data.cdc.gov/d/gb4e-yj24)
+- [U.S. Census Bureau county population estimates](https://www.census.gov/programs-surveys/popest/data/data-sets.2024.html)
+- [U.S. Census Bureau county geographic boundaries](https://www.census.gov/geographies/mapping-files/time-series/geo/cartographic-boundary.html)
+- [USGS The National Map topographic basemap](https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer)
+
+**Missing data:** `r join_check` counties have no calculable SMR (`r if (length(missing_map_names)) paste(missing_map_names, collapse = ", ") else "none"`). Across 335 county-year observations, `r n_suppressed` had unavailable death counts, `r n_no_cdc_row` had no matching CDC record, and `r n_partial` counties had incomplete data across the five years. Missing death counts were treated as missing rather than zero.
+
+**Limitations:** Overdose death counts are provisional and may be updated. Missing data can affect comparisons between counties and years, and the mortality rates are not adjusted for age. These differences should not be interpreted as evidence of causation.
